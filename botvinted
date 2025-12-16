@@ -338,4 +338,5 @@ def api_search():
 
 if __name__ == "__main__":
     # Note: debug=True est utile pour dev, mais en prod utiliser Gunicorn
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run()
+
