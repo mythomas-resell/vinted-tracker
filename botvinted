@@ -1,0 +1,341 @@
+from flask import Flask, request, jsonify, render_template_string
+import requests
+import time
+import random
+from fake_useragent import UserAgent  # Optionnel, sinon on utilise une string fixe
+
+# Si vous n'avez pas fake_useragent, faites: pip install fake-useragent
+# Ou remplacez ua.random par la chaîne fixe ci-dessous dans le code.
+
+app = Flask(__name__)
+
+# Configuration
+VINTED_URL = "https://www.vinted.fr"
+API_URL = "https://www.vinted.fr/api/v2/catalog/items"
+
+# Headers réalistes pour passer pour un navigateur
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+# Session globale pour garder les cookies entre les appels
+session = requests.Session()
+session.headers.update({
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": VINTED_URL
+})
+
+# Cache pour éviter de spammer l'API pour les mêmes estimations
+MARKET_CACHE = {}
+CACHE_TTL = 300  # 5 minutes
+
+def init_session():
+    """Visite la page d'accueil pour récupérer les cookies (csrf, _vinted_fr_session)"""
+    try:
+        print("Initialisation de la session Vinted...")
+        resp = session.get(VINTED_URL, timeout=10)
+        if resp.status_code == 200:
+            print("Cookies récupérés avec succès.")
+            return True
+        else:
+            print(f"Erreur init session: {resp.status_code}")
+            return False
+    except Exception as e:
+        print(f"Erreur critique init session: {e}")
+        return False
+
+# Initialisation au démarrage
+init_session()
+
+def prix_ttc(prix):
+    """Estimation coût achat : Prix + Protection (0.7 + 5%) + Port (estimé 3.00)"""
+    frais_protection = 0.70 + (prix * 0.05)
+    port_estime = 3.00 # Moyenne basse
+    return round(prix + frais_protection + port_estime, 2)
+
+def get_market_average(title):
+    """
+    Cherche le prix moyen des articles similaires.
+    ATTENTION : Ralentit énormément l'app et risque le ban IP.
+    """
+    key = title.lower().strip()
+    now = time.time()
+
+    # Vérification Cache
+    if key in MARKET_CACHE:
+        ts, val = MARKET_CACHE[key]
+        if now - ts < CACHE_TTL:
+            return val
+
+    params = {
+        "search_text": title,
+        "order": "newest_first",
+        "per_page": 10, # On réduit pour aller vite
+        "page": 1
+    }
+
+    try:
+        # Petit délai pour être gentil avec l'API
+        time.sleep(random.uniform(0.5, 1.5)) 
+        
+        r = session.get(API_URL, params=params, timeout=5)
+        
+        if r.status_code == 401 or r.status_code == 403:
+            print("Session expirée, tentative de reconnexion...")
+            init_session()
+            return None # On abandonne pour cette fois
+            
+        data = r.json()
+        items = data.get("items", [])
+        
+        prices = []
+        for it in items:
+            try:
+                p = float(it.get("price", {}).get("amount", it.get("price", 0)))
+                # On exclut les prix aberrants (trop bas ou trop hauts pour être pertinents pour la moyenne)
+                if p > 1: 
+                    prices.append(p)
+            except:
+                pass
+
+        if len(prices) < 3:
+            return None
+
+        # On enlève le prix le plus haut et le plus bas pour lisser
+        if len(prices) > 5:
+            prices.sort()
+            prices = prices[1:-1]
+
+        avg = sum(prices) / len(prices)
+        resale = round(avg, 2) # Prix de marché moyen
+
+        MARKET_CACHE[key] = (now, resale)
+        return resale
+
+    except Exception as e:
+        print(f"Erreur market check pour {title}: {e}")
+        return None
+
+def fetch_items(search_params):
+    try:
+        r = session.get(API_URL, params=search_params, timeout=10)
+        
+        if r.status_code != 200:
+            print(f"Erreur API: {r.status_code}")
+            # Si erreur, on tente de rafraichir la session
+            init_session()
+            return []
+
+        data = r.json()
+        items = data.get("items", [])
+        results = []
+
+        # LIMITATION : On ne traite que les 5 premiers pour éviter de faire attendre l'utilisateur 10 plombes
+        # et éviter le ban IP immédiat à cause des appels récursifs.
+        for it in items[:5]: 
+            price = float(it.get("price", {}).get("amount", it.get("price", 0)))
+            ttc = prix_ttc(price)
+            
+            # Appel risqué (N+1 query)
+            resale_market = get_market_average(it["title"])
+
+            margin = None
+            roi = None
+
+            if resale_market:
+                # Marge brute (si on revend au prix du marché sans frais de vente type LBC)
+                margin = resale_market - ttc
+                if ttc > 0:
+                    roi = round((margin / ttc) * 100, 1)
+
+            # Gestion sécurisée des photos
+            photos = []
+            if "photos" in it:
+                photos = [p.get("url") for p in it["photos"][:1]]
+            elif "photo" in it:
+                 photos = [it["photo"].get("url")]
+
+            results.append({
+                "id": str(it["id"]),
+                "title": it["title"],
+                "price": price,
+                "price_ttc": ttc,
+                "resale": resale_market,
+                "margin": margin,
+                "roi": roi,
+                "url": it["url"],
+                "brand": it.get("brand_title", ""),
+                "photos": photos
+            })
+
+        # Tri par ROI descendant
+        results.sort(key=lambda x: x["roi"] if x["roi"] is not None else -999, reverse=True)
+        return results
+    except Exception as e:
+        print(f"Erreur fetch_items: {e}")
+        return []
+
+HTML = """
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vinted Tracker Pro</title>
+<style>
+    body{font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;background:#f0f2f5;margin:0;padding:0;color:#333}
+    header{background:#09b1ba;color:white;padding:15px;text-align:center;font-size:24px;font-weight:700;box-shadow:0 2px 4px rgba(0,0,0,0.1)}
+    .container{max-width:800px;margin:20px auto;padding:0 15px}
+    .controls{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap}
+    input{flex:1;padding:12px;font-size:16px;border-radius:8px;border:1px solid #ddd;outline:none}
+    input:focus{border-color:#09b1ba}
+    button{padding:12px 20px;font-size:16px;border-radius:8px;border:none;cursor:pointer;background:#09b1ba;color:white;font-weight:600;transition:0.2s}
+    button:hover{background:#078a91}
+    button:disabled{background:#ccc;cursor:not-allowed}
+    .card{background:white;border-radius:12px;padding:15px;margin-bottom:15px;display:flex;gap:15px;align-items:start;box-shadow:0 2px 8px rgba(0,0,0,0.05);transition:transform 0.2s}
+    .card:hover{transform:translateY(-2px)}
+    .card img{width:110px;height:110px;object-fit:cover;border-radius:8px;background:#eee}
+    .info{flex:1}
+    .title{font-size:16px;font-weight:600;margin-bottom:5px;line-height:1.3}
+    .price-block{display:flex;gap:15px;margin:8px 0;font-size:14px}
+    .main-price{color:#09b1ba;font-weight:700;font-size:18px}
+    .stats{background:#f8f9fa;padding:8px;border-radius:6px;font-size:13px;color:#555;display:grid;grid-template-columns:1fr 1fr;gap:5px}
+    .roi-good{color:#28a745;font-weight:bold}
+    .roi-bad{color:#dc3545;font-weight:bold}
+    .actions{margin-top:10px}
+    .btn-link{text-decoration:none;background:#09b1ba;color:white;padding:6px 12px;border-radius:4px;font-size:13px;display:inline-block}
+    .loading{text-align:center;padding:20px;color:#666;display:none}
+    .salon-bar{display:flex;gap:8px;overflow-x:auto;padding-bottom:10px;margin-bottom:10px}
+    .salon-tag{background:white;border:1px solid #ddd;padding:6px 12px;border-radius:20px;font-size:14px;cursor:pointer;white-space:nowrap}
+    .salon-tag.active{background:#09b1ba;color:white;border-color:#09b1ba}
+</style>
+</head>
+<body>
+<header>Vinted Tracker V2</header>
+<div class="container">
+    
+    <div class="salon-bar" id="salons">
+        <button onclick="createSalon()" style="padding:6px 12px;font-size:14px;border-radius:20px">+</button>
+    </div>
+
+    <div class="controls">
+        <input id="q" placeholder="Recherche (ex: Nike Dunk Low)..." onkeypress="if(event.key==='Enter') startSearch()">
+        <button onclick="startSearch()" id="btn-search">Rechercher</button>
+    </div>
+
+    <div id="loading" class="loading">Recherche et analyse des prix en cours...</div>
+    <div id="results"></div>
+</div>
+
+<script>
+let seen = new Set();
+let timer = null;
+let currentSalon = null;
+let isSearching = false;
+
+function createSalon(){
+    let name = prompt("Nom du salon (Marque/Modèle):");
+    if(!name) return;
+    
+    const btn = document.createElement("div");
+    btn.className = "salon-tag";
+    btn.innerText = name;
+    btn.onclick = () => { 
+        document.querySelectorAll(".salon-tag").forEach(b=>b.classList.remove("active"));
+        btn.classList.add("active"); 
+        currentSalon = name;
+        document.getElementById("q").value = name;
+        startSearch();
+    };
+    document.getElementById("salons").insertBefore(btn, document.getElementById("salons").lastElementChild);
+}
+
+async function poll(){
+    if(isSearching) return;
+    isSearching = true;
+    
+    const query = currentSalon || document.getElementById("q").value;
+    if(!query) { isSearching = false; return; }
+
+    try {
+        const r = await fetch("/api/search?q=" + encodeURIComponent(query));
+        const data = await r.json();
+
+        let newItems = 0;
+        // On inverse l'ordre pour que le plus récent (en haut de liste JSON) finisse en haut du HTML
+        data.reverse().forEach(it => {
+            if(seen.has(it.id)) return;
+            seen.add(it.id);
+            newItems++;
+
+            const roiClass = (it.roi > 30) ? 'roi-good' : (it.roi < 0 ? 'roi-bad' : '');
+            
+            const div = document.createElement("div");
+            div.className = "card";
+            div.innerHTML = `
+                <img src="${it.photos[0] || 'https://via.placeholder.com/150'}" loading="lazy">
+                <div class="info">
+                    <div class="title">${it.title}</div>
+                    <div class="price-block">
+                        <span class="main-price">${it.price} €</span>
+                        <span style="color:#777;align-self:center">TTC env. ${it.price_ttc} €</span>
+                    </div>
+                    <div class="stats">
+                        <div>Revente estimée: <b>${it.resale ? it.resale + ' €' : '?'}</b></div>
+                        <div>Marge: <b>${it.margin ? it.margin.toFixed(2) + ' €' : '?'}</b></div>
+                        <div style="grid-column:span 2">ROI: <span class="${roiClass}">${it.roi ? it.roi + ' %' : '?'}</span></div>
+                    </div>
+                    <div class="actions">
+                        <a class="btn-link" target="_blank" href="${it.url}">Voir sur Vinted</a>
+                    </div>
+                </div>
+            `;
+            document.getElementById("results").prepend(div);
+        });
+    } catch(e) {
+        console.error("Erreur polling", e);
+    } finally {
+        isSearching = false;
+        document.getElementById("loading").style.display = "none";
+        document.getElementById("btn-search").disabled = false;
+    }
+}
+
+function startSearch(){
+    seen.clear();
+    document.getElementById("results").innerHTML = "";
+    document.getElementById("loading").style.display = "block";
+    document.getElementById("btn-search").disabled = true;
+    
+    if(timer) clearInterval(timer);
+    
+    poll(); // Premier appel immédiat
+    
+    // On poll toutes les 20 secondes pour éviter de surcharger
+    timer = setInterval(poll, 20000); 
+}
+</script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    return render_template_string(HTML)
+
+@app.route("/api/search")
+def api_search():
+    q = request.args.get("q", "")
+    if not q: return jsonify([])
+    
+    params = {
+        "search_text": q,
+        "order": "newest_first",
+        "per_page": 20, 
+        "page": 1
+    }
+    return jsonify(fetch_items(params))
+
+if __name__ == "__main__":
+    # Note: debug=True est utile pour dev, mais en prod utiliser Gunicorn
+    app.run(host="0.0.0.0", port=5000, debug=True)
